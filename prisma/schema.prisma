@@ -1,0 +1,13 @@
+generator client {
+  provider = "prisma-client"
+}
+
+datasource db {
+  provider = "postgresql"
+  // The 'url' line is removed!
+}
+
+model Test {
+  id String @id @default(cuid())
+  name String
+}

@@ -4,11 +4,15 @@ import * as React from "react"
 import { useTheme } from "next-themes"
 import {
   Clock3,
+  Copy,
   Database,
   History as HistoryIcon,
   Loader2,
   Moon,
+  Save,
   SendHorizontal,
+  Shield,
+  SlidersHorizontal,
   Sun,
   Trash2,
 } from "lucide-react"
@@ -44,6 +48,11 @@ import { Textarea } from "@/components/ui/textarea"
 
 type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
 type HeaderRow = { id: string; key: string; value: string; enabled: boolean }
+type ParamRow = { id: string; key: string; value: string; enabled: boolean }
+type AuthState =
+  | { type: "none" }
+  | { type: "bearer"; token: string }
+  | { type: "basic"; username: string; password: string }
 type HistoryEntry = {
   id: string
   method: HttpMethod
@@ -63,8 +72,25 @@ type ResponseSnapshot = {
   rawBody: string
   contentType: string
 }
+type Environment = {
+  id: string
+  name: string
+  variables: { id: string; key: string; value: string; enabled: boolean }[]
+}
+type SavedRequest = {
+  id: string
+  name: string
+  method: HttpMethod
+  url: string
+  headers: HeaderRow[]
+  params: ParamRow[]
+  body: string
+  auth: AuthState
+}
 
 const HISTORY_STORAGE_KEY = "postman_clone_history_v1"
+const ENV_STORAGE_KEY = "postman_clone_envs_v1"
+const COLLECTION_STORAGE_KEY = "postman_clone_saved_requests_v1"
 const METHODS: HttpMethod[] = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 const DEFAULT_URL = "https://jsonplaceholder.typicode.com/posts/1"
 const HISTORY_LIMIT = 25
@@ -96,6 +122,42 @@ const tryFormatJson = (payload: string) => {
   }
 }
 
+const applyVariables = (
+  value: string,
+  variables: Environment["variables"]
+) => {
+  return value.replace(/{{(.*?)}}/g, (_match, key) => {
+    const found = variables.find(
+      (variable) => variable.enabled && variable.key === key.trim()
+    )
+    return found ? found.value : ""
+  })
+}
+
+const buildUrlWithParams = (url: string, params: ParamRow[]) => {
+  const enabled = params.filter((p) => p.enabled && p.key.trim())
+  if (enabled.length === 0) return url
+  const urlObj = new URL(url)
+  enabled.forEach((param) => {
+    urlObj.searchParams.set(param.key.trim(), param.value.trim())
+  })
+  return urlObj.toString()
+}
+
+const parseParamsFromUrl = (url: string): ParamRow[] => {
+  try {
+    const urlObj = new URL(url)
+    return Array.from(urlObj.searchParams.entries()).map(([key, value]) => ({
+      id: createId(),
+      key,
+      value,
+      enabled: true,
+    }))
+  } catch {
+    return []
+  }
+}
+
 export default function Home() {
   const { theme, setTheme } = useTheme()
   const [mounted, setMounted] = React.useState(false)
@@ -104,23 +166,56 @@ export default function Home() {
   const [headers, setHeaders] = React.useState<HeaderRow[]>([
     { id: createId(), key: "Accept", value: "application/json", enabled: true },
   ])
+  const [queryParams, setQueryParams] = React.useState<ParamRow[]>(
+    parseParamsFromUrl(DEFAULT_URL)
+  )
+  const [auth, setAuth] = React.useState<AuthState>({ type: "none" })
   const [body, setBody] = React.useState('{\n  "title": "Hello from Postman Clone"\n}')
   const [response, setResponse] = React.useState<ResponseSnapshot | null>(null)
   const [history, setHistory] = React.useState<HistoryEntry[]>([])
+  const [savedRequests, setSavedRequests] = React.useState<SavedRequest[]>([])
+  const [activeEnv, setActiveEnv] = React.useState<string | null>(null)
+  const [environments, setEnvironments] = React.useState<Environment[]>([
+    { id: "env-default", name: "Local", variables: [] },
+  ])
+  const [saveName, setSaveName] = React.useState("")
   const [sending, setSending] = React.useState(false)
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null)
+  const [responseView, setResponseView] = React.useState<"pretty" | "raw">("pretty")
 
   React.useEffect(() => setMounted(true), [])
 
   React.useEffect(() => {
     if (typeof window === "undefined") return
-    const saved = window.localStorage.getItem(HISTORY_STORAGE_KEY)
-    if (!saved) return
-    try {
-      const parsed = JSON.parse(saved) as HistoryEntry[]
-      setHistory(parsed)
-    } catch {
-      // ignore malformed history
+    const savedHistory = window.localStorage.getItem(HISTORY_STORAGE_KEY)
+    if (savedHistory) {
+      try {
+        setHistory(JSON.parse(savedHistory) as HistoryEntry[])
+      } catch {
+        // ignore malformed history
+      }
+    }
+
+    const savedEnvs = window.localStorage.getItem(ENV_STORAGE_KEY)
+    if (savedEnvs) {
+      try {
+        const parsed = JSON.parse(savedEnvs) as Environment[]
+        setEnvironments(parsed)
+        setActiveEnv(parsed[0]?.id ?? null)
+      } catch {
+        // ignore malformed envs
+      }
+    } else {
+      setActiveEnv("env-default")
+    }
+
+    const savedCollection = window.localStorage.getItem(COLLECTION_STORAGE_KEY)
+    if (savedCollection) {
+      try {
+        setSavedRequests(JSON.parse(savedCollection) as SavedRequest[])
+      } catch {
+        // ignore malformed saved requests
+      }
     }
   }, [])
 
@@ -131,6 +226,19 @@ export default function Home() {
       JSON.stringify(items.slice(0, HISTORY_LIMIT))
     )
   }, [])
+
+  const persistEnvironments = React.useCallback((envs: Environment[]) => {
+    if (typeof window === "undefined") return
+    window.localStorage.setItem(ENV_STORAGE_KEY, JSON.stringify(envs))
+  }, [])
+
+  const persistSavedRequests = React.useCallback(
+    (items: SavedRequest[]) => {
+      if (typeof window === "undefined") return
+      window.localStorage.setItem(COLLECTION_STORAGE_KEY, JSON.stringify(items))
+    },
+    []
+  )
 
   const pushHistory = React.useCallback(
     (entry: HistoryEntry) => {
@@ -174,10 +282,125 @@ export default function Home() {
     []
   )
 
+  const updateParam = React.useCallback(
+    (id: string, field: keyof Omit<ParamRow, "id">, value: string | boolean) =>
+      setQueryParams((current) =>
+        current.map((param) =>
+          param.id === id ? { ...param, [field]: value } : param
+        )
+      ),
+    []
+  )
+
+  const removeParam = React.useCallback(
+    (id: string) => setQueryParams((current) => current.filter((item) => item.id !== id)),
+    []
+  )
+
+  const addParamRow = React.useCallback(
+    () =>
+      setQueryParams((current) => [
+        ...current,
+        { id: createId(), key: "", value: "", enabled: true },
+      ]),
+    []
+  )
+
+  const syncParamsFromUrl = React.useCallback(() => {
+    setQueryParams(parseParamsFromUrl(url))
+  }, [url])
+
+  const addEnvironment = React.useCallback(() => {
+    setEnvironments((current) => {
+      const next = [
+        ...current,
+        { id: createId(), name: `Env ${current.length + 1}`, variables: [] },
+      ]
+      persistEnvironments(next)
+      return next
+    })
+  }, [persistEnvironments])
+
+  const updateEnvironmentVariables = React.useCallback(
+    (
+      envId: string,
+      update: (vars: Environment["variables"]) => Environment["variables"]
+    ) => {
+      setEnvironments((current) => {
+        const next = current.map((env) =>
+          env.id === envId ? { ...env, variables: update(env.variables) } : env
+        )
+        persistEnvironments(next)
+        return next
+      })
+    },
+    [persistEnvironments]
+  )
+
+  const updateEnvironmentName = React.useCallback(
+    (envId: string, name: string) => {
+      setEnvironments((current) => {
+        const next = current.map((env) =>
+          env.id === envId ? { ...env, name } : env
+        )
+        persistEnvironments(next)
+        return next
+      })
+    },
+    [persistEnvironments]
+  )
+
+  const removeEnvironment = React.useCallback(
+    (envId: string) => {
+      setEnvironments((current) => {
+        const filtered = current.filter((env) => env.id !== envId)
+        persistEnvironments(filtered)
+        if (activeEnv === envId) {
+          setActiveEnv(filtered[0]?.id ?? null)
+        }
+        return filtered
+      })
+    },
+    [activeEnv, persistEnvironments]
+  )
+
+  const saveCurrentRequest = React.useCallback(
+    (name: string) => {
+      const newRequest: SavedRequest = {
+        id: createId(),
+        name,
+        method,
+        url,
+        headers,
+        params: queryParams,
+        body,
+        auth,
+      }
+      setSavedRequests((current) => {
+        const next = [newRequest, ...current]
+        persistSavedRequests(next)
+        return next
+      })
+    },
+    [auth, body, headers, method, persistSavedRequests, queryParams, url]
+  )
+
+  const applySavedRequest = React.useCallback((request: SavedRequest) => {
+    setMethod(request.method)
+    setUrl(request.url)
+    setHeaders(request.headers)
+    setQueryParams(request.params)
+    setBody(request.body)
+    setAuth(request.auth)
+    setResponse(null)
+    setErrorMessage(null)
+  }, [])
+
   const applyHistoryEntry = React.useCallback(
     (entry: HistoryEntry) => {
       setMethod(entry.method)
       setUrl(entry.url)
+      setQueryParams(parseParamsFromUrl(entry.url))
       setResponse(null)
       setErrorMessage(null)
     },
@@ -195,21 +418,44 @@ export default function Home() {
     setErrorMessage(null)
 
     const start = performance.now()
-    const activeHeaders = headers
+    const currentEnvVars =
+      environments.find((env) => env.id === activeEnv)?.variables ?? []
+
+    const resolvedHeaders = headers.map((header) => ({
+      ...header,
+      key: applyVariables(header.key, currentEnvVars),
+      value: applyVariables(header.value, currentEnvVars),
+    }))
+
+    const activeHeaders = resolvedHeaders
       .filter((item) => item.enabled && item.key.trim())
       .reduce<Record<string, string>>((acc, curr) => {
         acc[curr.key.trim()] = curr.value.trim()
         return acc
       }, {})
 
+    if (auth.type === "bearer" && auth.token.trim()) {
+      activeHeaders["Authorization"] = `Bearer ${applyVariables(
+        auth.token,
+        currentEnvVars
+      )}`
+    }
+
+    if (auth.type === "basic" && auth.username) {
+      const user = applyVariables(auth.username, currentEnvVars)
+      const pass = applyVariables(auth.password, currentEnvVars)
+      activeHeaders["Authorization"] = `Basic ${btoa(`${user}:${pass}`)}`
+    }
+
     const init: RequestInit = {
       method,
       headers: activeHeaders,
     }
 
-    const hasBody = method !== "GET" && body.trim().length > 0
+    const resolvedBody = applyVariables(body, currentEnvVars)
+    const hasBody = method !== "GET" && resolvedBody.trim().length > 0
     const looksLikeJson =
-      body.trim().startsWith("{") || body.trim().startsWith("[")
+      resolvedBody.trim().startsWith("{") || resolvedBody.trim().startsWith("[")
     const hasContentType = Object.keys(activeHeaders).some(
       (key) => key.toLowerCase() === "content-type"
     )
@@ -218,11 +464,28 @@ export default function Home() {
       if (!hasContentType && looksLikeJson) {
         activeHeaders["Content-Type"] = "application/json"
       }
-      init.body = body
+      init.body = resolvedBody
+    }
+
+    const resolvedParams = queryParams.map((param) => ({
+      ...param,
+      key: applyVariables(param.key, currentEnvVars),
+      value: applyVariables(param.value, currentEnvVars),
+    }))
+
+    const resolvedUrl = applyVariables(url, currentEnvVars)
+
+    let finalUrl = resolvedUrl
+    try {
+      finalUrl = buildUrlWithParams(resolvedUrl, resolvedParams)
+    } catch {
+      setSending(false)
+      setErrorMessage("Invalid URL. Please check the value or variables.")
+      return
     }
 
     try {
-      const res = await fetch(url, init)
+      const res = await fetch(finalUrl, init)
       const text = await res.text()
       const elapsed = Math.round(performance.now() - start)
       const size =
@@ -243,7 +506,7 @@ export default function Home() {
         headers: headerEntries,
         body:
           contentType.includes("application/json") || looksLikeJson
-            ? tryFormatJson(text)
+            ? tryFormatJson(text || "")
             : text || "Empty body",
         rawBody: text,
         contentType,
@@ -252,7 +515,7 @@ export default function Home() {
       pushHistory({
         id: createId(),
         method,
-        url,
+        url: finalUrl,
         status: res.status,
         timeMs: elapsed,
         timestamp: Date.now(),
@@ -265,16 +528,34 @@ export default function Home() {
       pushHistory({
         id: createId(),
         method,
-        url,
+        url: finalUrl,
         timeMs: elapsed,
         timestamp: Date.now(),
       })
     } finally {
       setSending(false)
     }
-  }, [body, headers, method, pushHistory, url])
+  }, [activeEnv, auth, body, environments, headers, method, pushHistory, queryParams, url])
 
   const themeIsDark = mounted && theme === "dark"
+  const currentEnv =
+    environments.find((env) => env.id === activeEnv) ?? environments[0] ?? null
+  const currentEnvVars = currentEnv?.variables ?? []
+  const copyToClipboard = React.useCallback(async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(value)
+    } catch {
+      // ignore copy failures
+    }
+  }, [])
+
+  const prettyBody =
+    response && response.contentType.includes("application/json")
+      ? tryFormatJson(response.rawBody || "")
+      : response?.body ?? ""
+
+  const displayedBody =
+    responseView === "pretty" ? prettyBody : response?.rawBody ?? ""
 
   return (
     <div className="bg-background text-foreground flex min-h-screen flex-col">
@@ -357,11 +638,74 @@ export default function Home() {
                   </div>
                 </div>
 
-                <Tabs defaultValue="headers" className="flex flex-col gap-3">
+                <Tabs defaultValue="params" className="flex flex-col gap-3">
                   <TabsList>
+                    <TabsTrigger value="params">Params</TabsTrigger>
                     <TabsTrigger value="headers">Headers</TabsTrigger>
                     <TabsTrigger value="body">Body</TabsTrigger>
+                    <TabsTrigger value="auth">Auth</TabsTrigger>
+                    <TabsTrigger value="environment">Environment</TabsTrigger>
+                    <TabsTrigger value="saved">Saved</TabsTrigger>
                   </TabsList>
+
+                  <TabsContent value="params" className="space-y-3">
+                    <div className="flex items-center gap-2">
+                      <Button variant="outline" size="sm" onClick={addParamRow}>
+                        Add param
+                      </Button>
+                      <Button variant="ghost" size="sm" onClick={syncParamsFromUrl}>
+                        <SlidersHorizontal className="mr-2 size-4" />
+                        Sync from URL
+                      </Button>
+                      <p className="text-muted-foreground text-xs">
+                        Params are appended to the request URL.
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      {queryParams.length === 0 ? (
+                        <div className="text-muted-foreground rounded-md border border-dashed px-3 py-2 text-sm">
+                          No params added. Click "Add param" to create one.
+                        </div>
+                      ) : (
+                        queryParams.map((param) => (
+                          <div
+                            key={param.id}
+                            className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto] items-center gap-2"
+                          >
+                            <Input
+                              placeholder="Key"
+                              value={param.key}
+                              onChange={(event) =>
+                                updateParam(param.id, "key", event.target.value)
+                              }
+                            />
+                            <Input
+                              placeholder="Value"
+                              value={param.value}
+                              onChange={(event) =>
+                                updateParam(param.id, "value", event.target.value)
+                              }
+                            />
+                            <Button
+                              variant={param.enabled ? "secondary" : "outline"}
+                              size="sm"
+                              onClick={() => updateParam(param.id, "enabled", !param.enabled)}
+                            >
+                              {param.enabled ? "On" : "Off"}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => removeParam(param.id)}
+                              aria-label="Delete param"
+                            >
+                              <Trash2 className="size-4" />
+                            </Button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </TabsContent>
 
                   <TabsContent value="headers" className="space-y-3">
                     <div className="space-y-2">
@@ -426,6 +770,281 @@ export default function Home() {
                     <p className="text-muted-foreground text-xs">
                       GET requests do not send a body.
                     </p>
+                  </TabsContent>
+
+                  <TabsContent value="auth" className="space-y-3">
+                    <div className="flex flex-col gap-3 md:flex-row md:items-center">
+                      <div className="md:w-48">
+                        <Label>Auth type</Label>
+                        <Select
+                          value={auth.type}
+                          onValueChange={(value: AuthState["type"]) => {
+                            if (value === "none") setAuth({ type: "none" })
+                            if (value === "bearer")
+                              setAuth({ type: "bearer", token: "" })
+                            if (value === "basic")
+                              setAuth({ type: "basic", username: "", password: "" })
+                          }}
+                        >
+                          <SelectTrigger className="w-full">
+                            <SelectValue placeholder="Auth" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="none">None</SelectItem>
+                            <SelectItem value="bearer">Bearer</SelectItem>
+                            <SelectItem value="basic">Basic</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      {auth.type === "bearer" && (
+                        <div className="flex flex-1 flex-col gap-2">
+                          <Label htmlFor="bearer-token">Bearer token</Label>
+                          <Input
+                            id="bearer-token"
+                            placeholder="eyJhbGciOi..."
+                            value={auth.token}
+                            onChange={(event) =>
+                              setAuth({ type: "bearer", token: event.target.value })
+                            }
+                          />
+                        </div>
+                      )}
+                      {auth.type === "basic" && (
+                        <div className="flex flex-1 flex-col gap-2">
+                          <Label>Username</Label>
+                          <Input
+                            placeholder="user"
+                            value={auth.username}
+                            onChange={(event) =>
+                              setAuth({
+                                type: "basic",
+                                username: event.target.value,
+                                password: auth.password,
+                              })
+                            }
+                          />
+                          <Label>Password</Label>
+                          <Input
+                            placeholder="******"
+                            type="password"
+                            value={auth.password}
+                            onChange={(event) =>
+                              setAuth({
+                                type: "basic",
+                                username: auth.username,
+                                password: event.target.value,
+                              })
+                            }
+                          />
+                        </div>
+                      )}
+                    </div>
+                    <Alert>
+                      <Shield className="size-4" />
+                      <AlertTitle>Variable support</AlertTitle>
+                      <AlertDescription>
+                        You can reference environment variables in auth fields using
+                        {" {{KEY}}"} syntax.
+                      </AlertDescription>
+                    </Alert>
+                  </TabsContent>
+
+                  <TabsContent value="environment" className="space-y-3">
+                    <div className="flex flex-col gap-3">
+                      <div className="flex flex-col gap-2 md:flex-row md:items-center md:gap-3">
+                        <div className="md:w-48">
+                          <Label>Active environment</Label>
+                          <Select
+                            value={currentEnv?.id}
+                            onValueChange={(value) => setActiveEnv(value)}
+                          >
+                            <SelectTrigger className="w-full">
+                              <SelectValue placeholder="Select environment" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {environments.map((env) => (
+                                <SelectItem key={env.id} value={env.id}>
+                                  {env.name}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div className="flex flex-1 flex-wrap items-center gap-2">
+                          <Input
+                            value={currentEnv?.name ?? ""}
+                            onChange={(event) =>
+                              currentEnv &&
+                              updateEnvironmentName(currentEnv.id, event.target.value)
+                            }
+                            placeholder="Environment name"
+                            className="md:w-64"
+                          />
+                          <Button variant="outline" size="sm" onClick={addEnvironment}>
+                            New environment
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => currentEnv && removeEnvironment(currentEnv.id)}
+                            disabled={!currentEnv || environments.length === 1}
+                          >
+                            Delete
+                          </Button>
+                        </div>
+                      </div>
+                      <div className="space-y-2">
+                        {(currentEnvVars ?? []).map((variable) => (
+                          <div
+                            key={variable.id}
+                            className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto] items-center gap-2"
+                          >
+                            <Input
+                              placeholder="Key"
+                              value={variable.key}
+                              onChange={(event) =>
+                                currentEnv &&
+                                updateEnvironmentVariables(currentEnv.id, (vars) =>
+                                  vars.map((item) =>
+                                    item.id === variable.id
+                                      ? { ...item, key: event.target.value }
+                                      : item
+                                  )
+                                )
+                              }
+                            />
+                            <Input
+                              placeholder="Value"
+                              value={variable.value}
+                              onChange={(event) =>
+                                currentEnv &&
+                                updateEnvironmentVariables(currentEnv.id, (vars) =>
+                                  vars.map((item) =>
+                                    item.id === variable.id
+                                      ? { ...item, value: event.target.value }
+                                      : item
+                                  )
+                                )
+                              }
+                            />
+                            <Button
+                              variant={variable.enabled ? "secondary" : "outline"}
+                              size="sm"
+                              onClick={() =>
+                                currentEnv &&
+                                updateEnvironmentVariables(currentEnv.id, (vars) =>
+                                  vars.map((item) =>
+                                    item.id === variable.id
+                                      ? { ...item, enabled: !item.enabled }
+                                      : item
+                                  )
+                                )
+                              }
+                            >
+                              {variable.enabled ? "On" : "Off"}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() =>
+                                currentEnv &&
+                                updateEnvironmentVariables(currentEnv.id, (vars) =>
+                                  vars.filter((item) => item.id !== variable.id)
+                                )
+                              }
+                              aria-label="Delete variable"
+                            >
+                              <Trash2 className="size-4" />
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            currentEnv &&
+                            updateEnvironmentVariables(currentEnv.id, (vars) => [
+                              ...vars,
+                              { id: createId(), key: "", value: "", enabled: true },
+                            ])
+                          }
+                          disabled={!currentEnv}
+                        >
+                          Add variable
+                        </Button>
+                        <p className="text-muted-foreground text-xs">
+                          Use variables anywhere with {"{{KEY}}"} syntax.
+                        </p>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="saved" className="space-y-3">
+                    <div className="flex flex-col gap-2 md:flex-row md:items-center">
+                      <Input
+                        placeholder="Request name"
+                        value={saveName}
+                        onChange={(event) => setSaveName(event.target.value)}
+                        className="md:w-64"
+                      />
+                      <Button
+                        size="sm"
+                        onClick={() => {
+                          if (!saveName.trim()) return
+                          saveCurrentRequest(saveName.trim())
+                          setSaveName("")
+                        }}
+                      >
+                        <Save className="mr-2 size-4" />
+                        Save current
+                      </Button>
+                    </div>
+                    <div className="bg-muted/30 divide-y rounded-lg border">
+                      {savedRequests.length === 0 ? (
+                        <div className="text-muted-foreground px-4 py-3 text-sm">
+                          No saved requests yet. Save one to see it here.
+                        </div>
+                      ) : (
+                        savedRequests.map((request) => (
+                          <div
+                            key={request.id}
+                            className="flex items-center justify-between gap-3 px-4 py-3"
+                          >
+                            <div className="flex flex-1 items-center gap-2">
+                              <Badge variant="outline">{request.method}</Badge>
+                              <span className="truncate text-sm font-medium">
+                                {request.name}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => applySavedRequest(request)}
+                              >
+                                Load
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label="Delete saved request"
+                                onClick={() =>
+                                  setSavedRequests((current) => {
+                                    const next = current.filter((item) => item.id !== request.id)
+                                    persistSavedRequests(next)
+                                    return next
+                                  })
+                                }
+                              >
+                                <Trash2 className="size-4" />
+                              </Button>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
                   </TabsContent>
                 </Tabs>
               </CardContent>
@@ -526,6 +1145,11 @@ export default function Home() {
                     </div>
                   </div>
                 </div>
+                {response?.contentType && (
+                  <div className="text-muted-foreground text-xs">
+                    Content-Type: {response.contentType}
+                  </div>
+                )}
 
                 {errorMessage && (
                   <Alert variant="destructive">
@@ -544,12 +1168,60 @@ export default function Home() {
                       value="body"
                       className="flex-1 overflow-hidden rounded-lg border"
                     >
+                      <div className="flex items-center justify-between gap-2 border-b px-3 py-2 text-xs">
+                        <div className="flex items-center gap-2">
+                          <Button
+                            size="sm"
+                            variant={responseView === "pretty" ? "secondary" : "ghost"}
+                            onClick={() => setResponseView("pretty")}
+                          >
+                            Pretty
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant={responseView === "raw" ? "secondary" : "ghost"}
+                            onClick={() => setResponseView("raw")}
+                          >
+                            Raw
+                          </Button>
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => copyToClipboard(displayedBody)}
+                        >
+                          <Copy className="mr-2 size-4" />
+                          Copy body
+                        </Button>
+                      </div>
                       <pre className="bg-muted/40 h-full w-full overflow-auto p-4 text-sm">
-                        {response.body}
+                        {displayedBody || "No body"}
                       </pre>
+                      {response.contentType.includes("text/event-stream") && (
+                        <div className="text-muted-foreground border-t px-4 py-2 text-xs">
+                          Streaming/SSE responses show the text received so far.
+                        </div>
+                      )}
                     </TabsContent>
                     <TabsContent value="headers" className="flex-1 overflow-hidden">
-                      <div className="bg-muted/40 divide-y rounded-lg border">
+                      <div className="flex items-center justify-between gap-2 border-b px-3 py-2 text-xs">
+                        <span>Response headers</span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            copyToClipboard(
+                              response.headers
+                                .map((header) => `${header.key}: ${header.value}`)
+                                .join("\n")
+                            )
+                          }
+                        >
+                          <Copy className="mr-2 size-4" />
+                          Copy headers
+                        </Button>
+                      </div>
+                      <div className="bg-muted/40 divide-y rounded-b-lg border">
                         {response.headers.length === 0 ? (
                           <div className="text-muted-foreground p-4 text-sm">
                             Server returned no headers.
